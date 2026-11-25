@@ -501,6 +501,11 @@ export class AgentSession {
 	private _extensionErrorUnsubscriber?: () => void;
 	// Set by bindExtensions(): reload() restarts extensions only if the host started them.
 	private _extensionsBound = false;
+	/**
+	 * Set synchronously when a replacement starts or the session is disposed. A disposed session
+	 * is no longer rendered or persisted, so it must not start a run (#12243).
+	 */
+	private _disposed = false;
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
@@ -1474,11 +1479,34 @@ export class AgentSession {
 		}
 	}
 
+	/** Whether this session has been disposed or is being replaced. */
+	get isDisposed(): boolean {
+		return this._disposed;
+	}
+
+	/**
+	 * Close this session to new input before a replacement awaits its shutdown handlers.
+	 * The runtime calls this synchronously so a prompt arriving during that window is
+	 * rejected instead of running on a session that is about to be disposed (#12243).
+	 */
+	beginSessionReplacement(): void {
+		this._disposed = true;
+	}
+
+	/** Reject input to a session that is being replaced or has been disposed (#12243). */
+	private _throwIfDisposed(): void {
+		if (!this._disposed) return;
+		throw new Error(
+			"Cannot use a disposed or replaced session. Do not submit prompts or input to a captured session after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). Use the session passed to withSession instead.",
+		);
+	}
+
 	/**
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._disposed = true;
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1956,6 +1984,8 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		// Replacement may have begun while this prompt awaited input handlers or auth checks.
+		this._throwIfDisposed();
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[];
@@ -2175,6 +2205,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._throwIfDisposed();
 		if (this._isEmittingAgentSettled) {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
@@ -2343,6 +2374,7 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 	): Promise<QueuedInputDisposition> {
+		this._throwIfDisposed();
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
