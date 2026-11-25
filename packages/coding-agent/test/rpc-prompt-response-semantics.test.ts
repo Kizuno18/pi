@@ -457,6 +457,31 @@ describe("RPC prompt response semantics", () => {
 			await cleanup();
 		}
 	});
+
+	// #12243: a prompt admitted during replacement used to get a success response
+	// with disposition "started", then run invisibly on the disposed session.
+	it("emits a failure response for a prompt on a disposed session", async () => {
+		const { lineHandler, runtimeHost, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
+
+		try {
+			runtimeHost.session.dispose();
+			lineHandler(JSON.stringify({ id: "disposed", type: "prompt", message: "Hello" }));
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "disposed")).toEqual([
+					{
+						id: "disposed",
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: expect.stringContaining("disposed or replaced"),
+					},
+				]);
+			});
+			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toHaveLength(0);
+		} finally {
+			await cleanup();
+		}
+	});
 });
 
 describe("RPC extension shutdown requests", () => {

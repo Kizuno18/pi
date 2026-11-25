@@ -29,6 +29,22 @@ type RecordedSessionEvent =
 	| SessionShutdownEvent
 	| SessionStartEvent;
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() > deadline) throw new Error("Timed out waiting for test condition");
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
 describe("AgentSessionRuntime characterization", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -716,5 +732,143 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(runtime.session.model?.id).toBe("faux-2");
 		expect(runtime.session.thinkingLevel).toBe("off");
+	});
+
+	// #12243: a prompt admitted while session_shutdown handlers await used to start
+	// a live run on the outgoing session, invisible to the replacement.
+	it("rejects a prompt sent during session_shutdown without calling the provider or a tool", async () => {
+		const shutdownStarted = deferred();
+		const releaseShutdown = deferred();
+		const releaseAgentStart = deferred();
+		let agentStartEntered = false;
+		let toolExecutions = 0;
+
+		const { runtime, faux } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.on("session_shutdown", async () => {
+				shutdownStarted.resolve();
+				await releaseShutdown.promise;
+			});
+			pi.on("before_agent_start", async (event) => {
+				if (event.messageType === "user" && event.prompt === "during shutdown") {
+					agentStartEntered = true;
+					await releaseAgentStart.promise;
+				}
+			});
+			pi.registerTool({
+				name: "probe",
+				label: "Probe",
+				description: "Counts executions on a disposed session",
+				parameters: Type.Object({}),
+				execute: async () => {
+					toolExecutions++;
+					return { content: [{ type: "text", text: "ok" }], details: {} };
+				},
+			});
+		});
+
+		await runtime.session.prompt("seed");
+		const sessionFile = runtime.session.sessionFile!;
+		const baselineCalls = faux.state.callCount;
+		faux.setResponses(
+			Array.from({ length: 10 }, () => fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" })),
+		);
+
+		const outgoing = runtime.session;
+		const dispositions: string[] = [];
+		let promptError: string | undefined;
+		const switchDone = runtime.switchSession(sessionFile);
+		await shutdownStarted.promise;
+
+		const promptDone = outgoing
+			.prompt("during shutdown", {
+				source: "rpc",
+				preflightResult: (disposition) => dispositions.push(disposition),
+			})
+			.then(
+				() => undefined,
+				(error: Error) => {
+					promptError = error.message;
+				},
+			);
+		await waitFor(() => promptError !== undefined || agentStartEntered);
+
+		releaseShutdown.resolve();
+		await switchDone;
+		await runtime.session.bindExtensions({});
+		releaseAgentStart.resolve();
+		await waitFor(() => promptError !== undefined || dispositions.length > 0);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		await outgoing.abort().catch(() => {});
+		await promptDone;
+
+		expect(faux.state.callCount).toBe(baselineCalls);
+		expect(toolExecutions).toBe(0);
+		expect(dispositions).toEqual([]);
+		expect(promptError).toMatch(/disposed or replaced/);
+		expect(runtime.session.messages.some((message) => JSON.stringify(message).includes("during shutdown"))).toBe(
+			false,
+		);
+		expect(outgoing.isDisposed).toBe(true);
+	});
+
+	it("rejects a prompt whose input handler awaits across the start of replacement", async () => {
+		const releaseInput = deferred();
+		let inputEntered = false;
+		let toolExecutions = 0;
+
+		const { runtime, faux } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.on("input", async (event) => {
+				if (event.text === "overlap") {
+					inputEntered = true;
+					await releaseInput.promise;
+				}
+			});
+			pi.registerTool({
+				name: "probe",
+				label: "Probe",
+				description: "Counts executions after the outgoing session is disposed",
+				parameters: Type.Object({}),
+				execute: async () => {
+					toolExecutions++;
+					return { content: [{ type: "text", text: "ok" }], details: {} };
+				},
+			});
+		});
+
+		await runtime.session.prompt("seed");
+		const sessionFile = runtime.session.sessionFile!;
+		const baselineCalls = faux.state.callCount;
+		faux.setResponses(
+			Array.from({ length: 10 }, () => fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" })),
+		);
+
+		const outgoing = runtime.session;
+		const dispositions: string[] = [];
+		let promptError: string | undefined;
+		const promptDone = outgoing
+			.prompt("overlap", {
+				source: "rpc",
+				preflightResult: (disposition) => dispositions.push(disposition),
+			})
+			.then(
+				() => undefined,
+				(error: Error) => {
+					promptError = error.message;
+				},
+			);
+		await waitFor(() => inputEntered);
+		await runtime.switchSession(sessionFile);
+		await runtime.session.bindExtensions({});
+		releaseInput.resolve();
+		await waitFor(() => promptError !== undefined || dispositions.length > 0);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		await outgoing.abort().catch(() => {});
+		await promptDone;
+
+		expect(faux.state.callCount).toBe(baselineCalls);
+		expect(toolExecutions).toBe(0);
+		expect(dispositions).toEqual([]);
+		expect(promptError).toMatch(/disposed or replaced/);
+		expect(outgoing.isDisposed).toBe(true);
 	});
 });
