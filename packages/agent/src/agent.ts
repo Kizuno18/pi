@@ -37,13 +37,26 @@ import type {
 export type { QueueMode } from "./types.ts";
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		(message) =>
-			message.role === "system" ||
-			message.role === "user" ||
-			message.role === "assistant" ||
-			message.role === "toolResult",
-	);
+	return messages
+		.map((message) => {
+			if (message.role !== "assistant" || !Array.isArray(message.content)) {
+				return message;
+			}
+			const content = message.content.map((block: any) => {
+				if (block?.type === "toolCall" && block.name === "codemode" && typeof block.arguments?.code !== "string") {
+					return { ...block, arguments: { code: "" } };
+				}
+				return block;
+			});
+			return { ...message, content };
+		})
+		.filter(
+			(message) =>
+				message.role === "system" ||
+				message.role === "user" ||
+				message.role === "assistant" ||
+				message.role === "toolResult",
+		) as Message[];
 }
 
 const EMPTY_USAGE = {

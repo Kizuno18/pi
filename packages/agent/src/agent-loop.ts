@@ -724,15 +724,21 @@ async function prepareToolCall(
 	}
 	const tool = tools.find((t) => t.name === toolCall.name);
 	if (!tool) {
+		// Keep the replayed assistant call provider-safe: an unknown tool name must never be sent
+		// back as a native tool-use block. (#12150)
+		const originalName = toolCall.name;
+		toolCall.name = "invalid";
+		toolCall.arguments = {};
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			result: createErrorToolResult(`Tool ${originalName} not found`),
 			isError: true,
 		};
 	}
 
+	let preparedToolCall = toolCall;
 	try {
-		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		preparedToolCall = prepareToolCallArguments(tool, toolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
 		if (config.beforeToolCall) {
 			const beforeResult = await config.beforeToolCall(
@@ -770,6 +776,14 @@ async function prepareToolCall(
 			args: validatedArgs,
 		};
 	} catch (error) {
+		// A rejected call stays in history; replace its arguments with a provider-safe value so the
+		// next request does not replay an invalid native tool-use block (for example codemode's
+		// `{"":""}`). (#12150)
+		if (toolCall.name === "codemode") {
+			toolCall.arguments = { code: "" };
+		} else {
+			toolCall.arguments = {};
+		}
 		return {
 			kind: "immediate",
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),

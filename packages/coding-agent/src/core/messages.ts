@@ -192,7 +192,17 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					};
 				case "system":
 				case "user":
-				case "assistant":
+				case "assistant": {
+					const content = (Array.isArray(m.content)
+						? m.content.map((block: any) => {
+								if (block?.type === "toolCall" && block.name === "codemode" && typeof block.arguments?.code !== "string") {
+									return { ...block, arguments: { code: "" } };
+								}
+								return block;
+							})
+						: m.content) as any;
+					return { ...m, content };
+				}
 				case "toolResult":
 					return m;
 				default:
